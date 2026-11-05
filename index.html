@@ -12,6 +12,7 @@
 <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.110.0/dist/umd/supabase.js"></script>
 <script>try { tailwind.config = { corePlugins: { preflight: false } }; } catch (e) {}</script>
 
 <style>
@@ -245,6 +246,7 @@ body.tv #g-hora { height:56vh !important; }
       </div>
       <div class="acciones">
         <span class="tvbar"><span class="tvpuntos" id="tvPuntos"></span><button class="btn btn-sm" id="btnTvPausa" type="button">⏸ Pausar</button></span>
+        <button class="btn no-tv" id="btnNube" type="button">☁ Nube</button>
         <button class="btn btn-r" id="btnTv" type="button" title="Pantalla completa para la sala de comando">📺 Modo TV</button>
         <button class="btn no-tv" id="btnTema" type="button" title="Cambiar tema claro / oscuro">◐ Tema</button>
         <div class="menu no-tv">
@@ -257,6 +259,8 @@ body.tv #g-hora { height:56vh !important; }
             <button type="button" data-acc="restaurar">📂 Importar respaldo (JSON)</button>
             <hr>
             <button type="button" data-acc="umbrales">⚙ Umbrales de alertas</button>
+            <button type="button" data-acc="usuarios" class="oculto">👥 Usuarios y permisos</button>
+            <button type="button" data-acc="historial" class="oculto">🕘 Historial de cambios</button>
             <button type="button" data-acc="demo">🧪 Cargar demo (300 registros ficticios)</button>
             <button type="button" data-acc="borrarDemo">🧹 Borrar datos de demo</button>
             <button type="button" data-acc="ayuda">❓ Instructivo de uso</button>
@@ -498,6 +502,18 @@ const CONFIG_PREDIO = {
   guardias: ['Guardia A', 'Guardia B', 'Guardia C']
 };
 
+/* -------------------------------------------------------------------------
+   CONFIG_NUBE: proyecto de Supabase para compartir los datos entre equipos.
+   La clave "publishable" puede ir en la página: los datos los protege el
+   inicio de sesión y las reglas de seguridad (RLS) del script SQL.
+   NUNCA pongas acá la clave "service_role" / "secret".
+   ------------------------------------------------------------------------- */
+const CONFIG_NUBE = {
+  url: 'https://kxcdmhghewaivllegipc.supabase.co',
+  clave: 'sb_publishable__vlQvbIXhjIEMFrii0YJUQ_IRogabVr',
+  subirObservaciones: false   // true = las observaciones (pueden tener datos clínicos) también se suben
+};
+
 const AUTORIA = 'Maldonado Jorge Matias - Jorgematiasmaldonado@gmail.com - Base ETAC Punilla · © 2026 – Todos los derechos reservados';
 const LOGO = document.getElementById('logo').src;
 const ROJO = '#E31E24';
@@ -570,7 +586,7 @@ CONFIG_PREDIO.sectores.forEach((s) => { CAP_SECTOR[s.nombre] = ORDEN_CUADS.filte
 /* =========================================================================
    ALMACENAMIENTO LOCAL (IndexedDB, con respaldo en localStorage)
    ========================================================================= */
-let DB = { registros: [], archivos: [], ajustes: { ...AJUSTES_DEF }, novedades: '' };
+let DB = { registros: [], archivos: [], ajustes: { ...AJUSTES_DEF }, novedades: '', borrados: [], ultimoPull: null, cfgP: false, vaciarPend: false };
 const ALM = {
   nombre: 'etac_mesa_comando', clave: 'db',
   abrir() {
@@ -609,8 +625,8 @@ const ALM = {
   }
 };
 let tGuardar = null;
-function guardar() { clearTimeout(tGuardar); tGuardar = setTimeout(() => ALM.guardar(DB), 250); }
-function guardarYa() { clearTimeout(tGuardar); return ALM.guardar(DB); }
+function guardar() { clearTimeout(tGuardar); tGuardar = setTimeout(() => ALM.guardar(DB), 250); if (typeof nubeProgramar === 'function' && NUBE.ses && pendientes()) nubeProgramar(); }
+function guardarYa() { clearTimeout(tGuardar); if (typeof nubeProgramar === 'function' && NUBE.ses && pendientes()) nubeProgramar(); return ALM.guardar(DB); }
 const pref = {
   get(k, d) { try { const v = localStorage.getItem('etac_mesa_' + k); return v == null ? d : v; } catch (e) { return d; } },
   set(k, v) { try { localStorage.setItem('etac_mesa_' + k, v); } catch (e) {} }
@@ -814,12 +830,12 @@ function incorporar(raws, nombreArchivo, meta, extra) {
     if (r.id) {
       if (IDX.id.has(r.id)) { st.rep++; return; }
       const sinId = (IDX.clave.get(r.clave) || []).find((x) => !x.id);
-      if (sinId) {               // unir: queda la versión con ID
+      if (sinId && puede('editar')) {               // unir: queda la versión con ID (sólo admin puede modificar lo ya cargado)
         const origenAnt = sinId.archivo_origen;
         Object.assign(sinId, { ...r, uid: sinId.uid, obs: r.obs || sinId.obs, archivo_origen: r.archivo_origen + (origenAnt && origenAnt !== r.archivo_origen ? ' (antes: ' + origenAnt + ')' : '') });
         derivar(sinId);
         IDX.id.set(r.id, sinId);
-        st.rep++; st.unidos++;
+        marcar(sinId); st.rep++; st.unidos++;
         return;
       }
     } else {
@@ -828,6 +844,8 @@ function incorporar(raws, nombreArchivo, meta, extra) {
       vistos.set(r.clave, n);
       if (n <= previo.get(r.clave)) { st.rep++; return; }
     }
+    r.disp = raw.disp || DISP;
+    marcar(r);
     DB.registros.push(r);
     agregarAIndice(r);
     st.nuevos++;
@@ -1088,6 +1106,7 @@ let ultimoLote = [];
 async function importarArchivos(lista) {
   const files = Array.from(lista || []);
   if (!files.length) return;
+  if (!puede('importar')) { avisoPermiso(); return; }
   const lineas = [];
   toast('Importando ' + files.length + (files.length === 1 ? ' archivo…' : ' archivos…'), 60000);
   for (const f of files) {
@@ -1095,7 +1114,7 @@ async function importarArchivos(lista) {
     try {
       const res = await leerArchivo(f);
       const st = incorporar(res.filas, f.name, res.meta);
-      DB.archivos.push({ nombre: f.name, tipo: res.tipo, importado: Date.now(), ...st, efectivo: res.meta.efectivo ? mayus(res.meta.efectivo) : '',
+      DB.archivos.push({ uid: uid(), _p: 1, nombre: f.name, tipo: res.tipo, importado: Date.now(), ...st, efectivo: res.meta.efectivo ? mayus(res.meta.efectivo) : '',
         base: normBase(res.meta.base || ''), emitido: res.meta.emitido || null, periodo: res.meta.periodo || '' });
       if (res.meta.efectivo) registrarNombre(res.meta.efectivo);
       let txt = f.name + ': ' + st.nuevos + (st.nuevos === 1 ? ' registro nuevo, ' : ' registros nuevos, ') + st.rep + (st.rep === 1 ? ' repetido' : ' repetidos') + ' (ignorados), ' + st.err + ' con error';
@@ -1107,7 +1126,7 @@ async function importarArchivos(lista) {
       console.error(e);
       const msj = e instanceof NoEtac ? 'no parece un informe de ETAC (' + e.message + '). No se importó nada.' : (e.message || 'error al leer el archivo');
       lineas.push({ c: 'err', t: f.name + ': ' + msj });
-      DB.archivos.push({ nombre: f.name, tipo: 'error', importado: Date.now(), nuevos: 0, rep: 0, err: 1, rev: 0, mensaje: msj });
+      DB.archivos.push({ uid: uid(), _p: 1, nombre: f.name, tipo: 'error', importado: Date.now(), nuevos: 0, rep: 0, err: 1, rev: 0, mensaje: msj });
     }
   }
   ultimoLote = lineas;
@@ -1601,10 +1620,11 @@ function renderTabla() {
   const pags = Math.max(1, Math.ceil(lista.length / TAB.porPag));
   TAB.pag = Math.min(TAB.pag, pags - 1);
   const vis = lista.slice(TAB.pag * TAB.porPag, (TAB.pag + 1) * TAB.porPag);
+  const puedeEd = puede('editar');
   $('tReg').innerHTML = '<tr>' + COLS_REG.map(([k, l]) => '<th data-ord="' + k + '">' + esc(l) + (TAB.orden === k ? (TAB.dir > 0 ? ' ▲' : ' ▼') : '') + '</th>').join('') + '<th></th></tr>' +
     (vis.length ? vis.map((r) => '<tr class="' + (r.revisar && r.revisar.length ? 'rev' : '') + '"' + (r.revisar && r.revisar.length ? ' title="' + esc(r.revisar.join(' · ')) + '"' : '') + '>' +
       COLS_REG.map(([k, , fn]) => '<td' + (k === 'obs' ? ' class="obs"' : k === 'edad' ? ' class="n"' : '') + '>' + esc(fn(r)) + '</td>').join('') +
-      '<td style="white-space:nowrap"><button class="ico" type="button" title="Editar" data-ed="' + r.uid + '">✎</button><button class="ico" type="button" title="Borrar" data-bo="' + r.uid + '">🗑</button></td></tr>').join('')
+      '<td style="white-space:nowrap">' + (puedeEd ? '<button class="ico" type="button" title="Editar" data-ed="' + r.uid + '">✎</button><button class="ico" type="button" title="Borrar" data-bo="' + r.uid + '">🗑</button>' : '') + '</td></tr>').join('')
       : '<tr><td colspan="' + (COLS_REG.length + 1) + '" class="ref" style="padding:18px;text-align:center">Sin registros para mostrar.</td></tr>');
   $('pag').innerHTML = '<span>' + fmtN(lista.length) + ' registro(s) · página ' + (TAB.pag + 1) + ' de ' + pags + '</span>' +
     '<button class="btn btn-sm" type="button" data-pag="-1"' + (TAB.pag ? '' : ' disabled') + '>‹ Anterior</button><button class="btn btn-sm" type="button" data-pag="1"' + (TAB.pag < pags - 1 ? '' : ' disabled') + '>Siguiente ›</button>';
@@ -1612,6 +1632,7 @@ function renderTabla() {
 
 /* ---------- Edición y borrado ---------- */
 function editarRegistro(u) {
+  if (!puede('editar')) { avisoPermiso(); return; }
   const r = DB.registros.find((x) => x.uid === u); if (!r) return;
   const opt = (arr, v) => arr.map((o) => '<option' + (o === v ? ' selected' : '') + '>' + esc(o) + '</option>').join('');
   abrirModal('<h3>Editar registro</h3>' +
@@ -1641,10 +1662,10 @@ function editarRegistro(u) {
     if (fd.get('forzar')) n.revisar = [];
     if (n.revisar.length) n.crudo = r.crudo;
     const otro = DB.registros.find((x) => x.uid !== r.uid && ((n.id && x.id === n.id) || x.clave === n.clave));
-    const aplicar = () => { Object.keys(r).forEach((k) => delete r[k]); Object.assign(r, n); reindexar(); guardar(); cerrarModal(); render(); toast(n.revisar.length ? 'Guardado. Sigue "a revisar": ' + n.revisar.join(' · ') : 'Registro corregido.'); };
+    const aplicar = () => { n.disp = r.disp; Object.keys(r).forEach((k) => delete r[k]); Object.assign(r, n); marcar(r); reindexar(); guardar(); cerrarModal(); render(); toast(n.revisar.length ? 'Guardado. Sigue "a revisar": ' + n.revisar.join(' · ') : 'Registro corregido.'); };
     if (otro) {
       confirmar('Este registro coincide con otro ya cargado (' + esc(otro.fecha + ' ' + otro.hora + ' · ' + otro.cuadrante + ' · ' + nombreEf(otro)) + ', archivo ' + esc(otro.archivo_origen) + '). Si es el mismo paciente, conviene unirlos para no contarlo dos veces.',
-        'Unir (queda uno solo)', () => { DB.registros = DB.registros.filter((x) => x.uid !== r.uid); if (!otro.id && n.id) Object.assign(otro, { id: n.id }); reindexar(); guardar(); render(); toast('Registros unidos.'); },
+        'Unir (queda uno solo)', () => { DB.registros = DB.registros.filter((x) => x.uid !== r.uid); if (!r.demo) DB.borrados = (DB.borrados || []).concat([r.uid]); if (!otro.id && n.id) Object.assign(otro, { id: n.id }); derivar(otro); marcar(otro); reindexar(); guardar(); render(); toast('Registros unidos.'); },
         'Mantener los dos', aplicar);
       return;
     }
@@ -1652,9 +1673,10 @@ function editarRegistro(u) {
   };
 }
 function borrarRegistro(u) {
+  if (!puede('editar')) { avisoPermiso(); return; }
   const r = DB.registros.find((x) => x.uid === u); if (!r) return;
   confirmar('¿Borrar el registro de las ' + esc(r.hora) + ' en ' + esc(r.cuadrante || '?') + ' (' + esc(nombreEf(r)) + ')? No se puede deshacer.', 'Sí, borrar', () => {
-    DB.registros = DB.registros.filter((x) => x.uid !== u); reindexar(); guardar(); render(); toast('Registro borrado.');
+    DB.registros = DB.registros.filter((x) => x.uid !== u); if (!r.demo) DB.borrados = (DB.borrados || []).concat([u]); reindexar(); guardar(); render(); toast('Registro borrado.');
   });
 }
 
@@ -1730,6 +1752,7 @@ function render() {
   renderEstado();
   $('banDemo').classList.toggle('oculto', !DB.registros.some((r) => r.demo));
   if (!ultimoLote.length) mostrarLote();
+  if (typeof renderNube === 'function') { renderNube(); aplicarPermisosUI(); }
 }
 function renderEstado() {
   const arch = DB.archivos.filter((a) => a.tipo !== 'error');
@@ -1754,6 +1777,7 @@ function confirmar(texto, okTxt, okFn, otroTxt, otroFn) {
   if (otroTxt) $('btnOtro').onclick = () => { cerrarModal(); otroFn(); };
 }
 function verUmbrales() {
+  if (!puede('umbrales')) { avisoPermiso(); return; }
   const a = DB.ajustes;
   const c = (k, l, min, max) => '<label>' + l + '<input class="campo" type="number" name="' + k + '" min="' + min + '" max="' + max + '" value="' + a[k] + '"></label>';
   abrirModal('<h3>Umbrales de alertas</h3><p class="ref" style="margin-top:0">Se aplican sobre todos los datos cargados, tomando como referencia la hora actual (o el último dato si los datos no son de hoy).</p><form class="form" id="fUm">' +
@@ -1762,11 +1786,11 @@ function verUmbrales() {
     c('pctTraslado', '% de traslados en la última hora (alerta si lo supera)', 1, 100) + c('minPct', 'Mínimo de atenciones en la hora para evaluar el %', 1, 999) +
     c('destinoHora', 'Traslados a un mismo destino en la última hora', 1, 999) + c('silencioMin', 'Minutos sin datos de un efectivo o base', 5, 1440) +
     '</form><div class="modal-pie"><button class="btn" type="button" id="btnUmDef">Valores por defecto</button><button class="btn" type="button" data-cerrar="1">Cancelar</button><button class="btn btn-r" type="button" id="btnUmOk">Guardar</button></div>');
-  $('btnUmDef').onclick = () => { DB.ajustes = { ...AJUSTES_DEF }; guardar(); cerrarModal(); render(); toast('Umbrales restablecidos.'); };
+  $('btnUmDef').onclick = () => { DB.ajustes = { ...AJUSTES_DEF }; DB.cfgP = true; guardar(); cerrarModal(); render(); toast('Umbrales restablecidos.'); };
   $('btnUmOk').onclick = () => {
     const fd = new FormData($('fUm'));
     Object.keys(AJUSTES_DEF).forEach((k) => { const v = Number(fd.get(k)); if (isFinite(v) && v > 0) DB.ajustes[k] = v; });
-    guardar(); cerrarModal(); render(); toast('Umbrales guardados.');
+    DB.cfgP = true; guardar(); cerrarModal(); render(); toast('Umbrales guardados.');
   };
 }
 function verHistorial() {
@@ -1783,6 +1807,7 @@ function verAyuda() {
     '<li><b>Leé la banda de alertas</b>: cuadrantes con alta demanda, zonas calientes, Clero/Autoridades, cuadrantes sin cobertura y efectivos que no reportan. Tocá una alerta para ver el cuadrante.</li>' +
     '<li><b>Usá el mapa</b> para ver dónde se concentran las atenciones. Cambiá a "Cada 10.000 personas" para comparar FADEA con Frente. Tocá un cuadrante para ver el detalle.</li>' +
     '<li><b>Filtrá</b> por rango horario, sector, fila, base, guardia, cuadrante, efectivo, traslado o sexo. Los filtros activos se ven como etiquetas y se quitan con ×.</li>' +
+    '<li><b>☁ Nube</b>: tocá el botón de la nube e ingresá con tu usuario. Lo que importe cualquier equipo conectado aparece en vivo en todos. Sin internet se sigue trabajando y se sube solo al volver la conexión.</li>' +
     '<li><b>Modo TV</b> para la pantalla de la sala: pantalla completa, letra grande y vistas que rotan cada 20 s. Salí con Esc o con el botón.</li>' +
     '<li><b>Al cerrar cada etapa</b>, desde ☰ Menú: informe PDF para los jefes, Excel consolidado y <b>respaldo JSON</b> (para pasar los datos a otra computadora).</li>' +
     '</ol><p class="ref">Los datos quedan solamente en este equipo y navegador. No se envía nada a internet.</p></div><div class="modal-pie"><button class="btn btn-r" type="button" data-cerrar="1">Entendido</button></div>');
@@ -1805,7 +1830,7 @@ function elegirAlcance(titulo, fn, conNovedades) {
     '</form><div class="modal-pie"><button class="btn" type="button" data-cerrar="1">Cancelar</button><button class="btn btn-r" type="button" id="btnAlcOk">Generar</button></div>');
   $('btnAlcOk').onclick = async () => {
     const fd = new FormData($('fAlc')); const todo = fd.get('alc') === 't';
-    if (conNovedades) { DB.novedades = String(fd.get('nov') || ''); guardar(); }
+    if (conNovedades) { const nv = String(fd.get('nov') || ''); if (nv !== DB.novedades) { DB.novedades = nv; DB.cfgP = true; } guardar(); }
     cerrarModal();
     const lista = DB.registros.filter((r) => todo || pasa(r));
     try { await fn(lista, todo); } catch (e) { console.error(e); toast('No se pudo generar: ' + e.message, 7000); }
@@ -1835,7 +1860,7 @@ function exportarExcel(lista, todo) {
   toast('Excel consolidado descargado (' + lista.length + ' registros).');
 }
 function exportarRespaldo() {
-  const obj = { app: 'ETAC Mesa de Comando', version: 1, exportado: new Date().toISOString(), registros: DB.registros.map(({ ts, clave, sector, fila, especial, cat, ...r }) => r), archivos: DB.archivos, ajustes: DB.ajustes, novedades: DB.novedades };
+  const obj = { app: 'ETAC Mesa de Comando', version: 1, exportado: new Date().toISOString(), registros: DB.registros.map(({ ts, clave, sector, fila, especial, cat, _p, ...r }) => r), archivos: DB.archivos, ajustes: DB.ajustes, novedades: DB.novedades };
   descargar(new Blob([JSON.stringify(obj)], { type: 'application/json' }), 'ETAC_MesaComando_respaldo_' + marca() + '.json');
   toast('Respaldo descargado (' + DB.registros.length + ' registros).');
 }
@@ -1845,7 +1870,7 @@ async function restaurarRespaldo(file, enLote) {
     if (!obj || obj.app !== 'ETAC Mesa de Comando' || !Array.isArray(obj.registros)) throw new Error('no es un respaldo de la Mesa de Comando');
     const st = incorporar(obj.registros, file.name, {}, {});
     const nombres = new Set(DB.archivos.map((a) => a.nombre + '|' + a.importado));
-    (obj.archivos || []).forEach((a) => { if (!nombres.has(a.nombre + '|' + a.importado)) DB.archivos.push(a); });
+    (obj.archivos || []).forEach((a) => { if (!nombres.has(a.nombre + '|' + a.importado)) DB.archivos.push({ ...a, uid: a.uid || uid(), _p: 1 }); });
     if (obj.ajustes) DB.ajustes = { ...AJUSTES_DEF, ...obj.ajustes };
     if (obj.novedades && !DB.novedades) DB.novedades = obj.novedades;
     reindexar(); await guardarYa();
@@ -2031,13 +2056,295 @@ function borrarDemo() {
   DB.registros = DB.registros.filter((r) => !r.demo); reindexar(); guardar(); render(); toast('Se borraron ' + n + ' registros de demo.');
 }
 function vaciarDatos() {
-  confirmar('Se van a borrar <b>todos</b> los registros (' + fmtN(DB.registros.length) + ') y el historial de importaciones de este equipo. Antes conviene exportar un respaldo.', 'Continuar', () => {
+  if (!puede('vaciar')) { avisoPermiso(); return; }
+  const enNube = !!NUBE.ses;
+  confirmar('Se van a borrar <b>todos</b> los registros (' + fmtN(DB.registros.length) + ') y el historial de importaciones' + (enNube ? ' <b>de la nube: desaparecen en TODOS los dispositivos</b>' : ' de este equipo') + '. Antes conviene exportar un respaldo.', 'Continuar', () => {
     abrirModal('<h3>Última confirmación</h3><p>Escribí <b>VACIAR</b> para borrar todo.</p><input class="campo" id="inVaciar" autocomplete="off"><div class="modal-pie"><button class="btn" type="button" data-cerrar="1">Cancelar</button><button class="btn btn-r" type="button" id="btnVaciarOk">Borrar todo</button></div>');
     $('btnVaciarOk').onclick = async () => {
       if (norm($('inVaciar').value) !== 'VACIAR') { toast('Tenés que escribir VACIAR.'); return; }
-      DB = { registros: [], archivos: [], ajustes: DB.ajustes, novedades: '' }; reindexar(); ultimoLote = []; await guardarYa(); cerrarModal(); render(); toast('Se borraron todos los datos.');
+      DB = { registros: [], archivos: [], ajustes: DB.ajustes, novedades: '', borrados: [], ultimoPull: DB.ultimoPull, vaciarPend: enNube }; reindexar(); ultimoLote = []; await guardarYa(); cerrarModal(); render();
+      if (enNube) { try { await nubeVaciar(); toast('Se borraron todos los datos, también en la nube.'); } catch (e) { nubeFallo(e); toast('Se borró este equipo. En la nube se borrará cuando vuelva la conexión.', 7000); } } else toast('Se borraron todos los datos de este equipo.');
     };
   });
+}
+
+/* =========================================================================
+   NUBE (Supabase): los datos se comparten en vivo entre dispositivos.
+   - Cada equipo sigue guardando todo localmente (funciona sin internet).
+   - Lo nuevo o corregido queda "por subir" y se sube apenas hay conexión.
+   - Los cambios de otros equipos llegan en vivo (Realtime).
+   - Los datos de DEMO nunca se suben.
+   ========================================================================= */
+const NUBE = { cli: null, ses: null, estado: 'off', canal: null, subiendo: false, bajando: false, error: '', ultimaSync: 0, tSubir: null, tRemoto: null };
+const DISP = (() => { let d = pref.get('disp', ''); if (!d) { d = 'd' + Math.random().toString(36).slice(2, 10); pref.set('disp', d); } return d; })();
+function marcar(r) { if (r && !r.demo) r._p = Date.now() + Math.random(); }
+function pendientes() { return DB.registros.filter((r) => r._p && !r.demo).length + DB.archivos.filter((a) => a._p).length + (DB.borrados || []).length + (DB.cfgP ? 1 : 0); }
+const aFila = (r) => ({
+  uid: r.uid, id: r.id || null, fecha: r.fecha, hora: r.hora, efectivo: r.efectivo, base: r.base, guardia: r.guardia, cuadrante: r.cuadrante,
+  sexo: r.sexo, edad: r.edad === '' || r.edad == null ? null : Math.round(Number(r.edad)), traslado: r.traslado, destino: r.destino,
+  obs: CONFIG_NUBE.subirObservaciones ? (r.obs || null) : null, crudo: CONFIG_NUBE.subirObservaciones ? (r.crudo || null) : null,
+  archivo_origen: r.archivo_origen, importado: r.importado, revisar: r.revisar || [], disp: r.disp || '', borrado: false
+});
+const aFilaArchivo = (a) => ({ uid: a.uid, nombre: a.nombre, tipo: a.tipo, importado: a.importado, nuevos: a.nuevos || 0, rep: a.rep || 0, unidos: a.unidos || 0, err: a.err || 0, rev: a.rev || 0,
+  efectivo: a.efectivo || '', base: a.base || '', emitido: a.emitido || null, periodo: a.periodo || '', mensaje: a.mensaje || '', borrado: false });
+function deFila(f, loc) {
+  const r = { uid: f.uid, id: f.id || '', fecha: f.fecha || '', hora: f.hora || '', efectivo: f.efectivo || '', base: f.base || '', guardia: f.guardia || '', cuadrante: f.cuadrante || '',
+    sexo: f.sexo || '', edad: f.edad == null ? '' : f.edad, traslado: f.traslado || 'No', destino: f.destino || '', obs: f.obs || '', crudo: f.crudo || '',
+    archivo_origen: f.archivo_origen || '', importado: f.importado || Date.now(), revisar: Array.isArray(f.revisar) ? f.revisar : [], disp: f.disp || '' };
+  if (loc && !r.obs && loc.obs) r.obs = loc.obs;          // las observaciones locales no se pierden
+  if (loc && !r.crudo && loc.crudo) r.crudo = loc.crudo;
+  return derivar(r);
+}
+function nubeIniciar() {
+  if (!window.supabase || !CONFIG_NUBE.url || !CONFIG_NUBE.clave) { NUBE.estado = 'sinlib'; renderNube(); return; }
+  try {
+    NUBE.cli = supabase.createClient(CONFIG_NUBE.url, CONFIG_NUBE.clave, { auth: { persistSession: true, autoRefreshToken: true, storageKey: 'etac_mesa_sesion' } });
+  } catch (e) { console.error(e); NUBE.estado = 'error'; NUBE.error = e.message; renderNube(); return; }
+  NUBE.cli.auth.onAuthStateChange((ev, ses) => {
+    const antes = NUBE.ses ? NUBE.ses.user.id : null;
+    NUBE.ses = ses || null;
+    setTimeout(() => {
+      if (ses && antes !== ses.user.id) { NUBE.rol = null; nubeRol().then(nubeConectar); }
+      else if (!ses) { NUBE.rol = null; nubeDesconectar(); render(); }
+      renderNube();
+    }, 0);
+  });
+  window.addEventListener('online', () => { if (NUBE.ses) nubeConectar(); });
+  window.addEventListener('offline', () => { if (NUBE.ses) { NUBE.estado = 'offline'; renderNube(); } });
+  setInterval(() => { if (NUBE.ses && pendientes()) nubeSubir(); }, 30000);         // reintento de lo pendiente
+  setInterval(() => { if (NUBE.ses) nubeBajar(); }, 5 * 60000);                     // red de seguridad por si se perdió algún aviso
+  renderNube();
+}
+async function nubeConectar() {
+  if (!NUBE.cli || !NUBE.ses) return;
+  NUBE.estado = 'conectando'; renderNube();
+  try {
+    if (DB.vaciarPend) await nubeVaciar();
+    await nubeBajar();
+    nubeSuscribir();
+    await nubeSubir();
+  } catch (e) { nubeFallo(e); }
+}
+function nubeDesconectar() {
+  if (NUBE.canal && NUBE.cli) { try { NUBE.cli.removeChannel(NUBE.canal); } catch (e) {} }
+  NUBE.canal = null; NUBE.estado = 'off';
+}
+function nubeFallo(e) {
+  console.warn('Nube:', e);
+  NUBE.error = (e && e.message) || String(e);
+  NUBE.estado = navigator.onLine === false ? 'offline' : 'error';
+  renderNube();
+}
+function nubeSuscribir() {
+  if (NUBE.canal) return;
+  const cola = (t) => (p) => { if (p && p.new && p.new.uid !== undefined) colaRemota(t, p.new); else if (p && p.new && t === 'config') colaRemota(t, p.new); };
+  NUBE.canal = NUBE.cli.channel('etac-mesa')
+    .on('postgres_changes', { event: '*', schema: 'public', table: 'registros' }, cola('registros'))
+    .on('postgres_changes', { event: '*', schema: 'public', table: 'archivos' }, cola('archivos'))
+    .on('postgres_changes', { event: '*', schema: 'public', table: 'config' }, cola('config'))
+    .subscribe((st) => {
+      if (st === 'SUBSCRIBED') { NUBE.estado = 'vivo'; NUBE.error = ''; nubeBajar(); }
+      else if (st === 'CHANNEL_ERROR' || st === 'TIMED_OUT') { NUBE.estado = navigator.onLine === false ? 'offline' : 'reconectando'; }
+      else if (st === 'CLOSED' && NUBE.ses) NUBE.estado = 'reconectando';
+      renderNube();
+    });
+}
+const COLA = { registros: [], archivos: [], config: [] };
+function colaRemota(t, fila) {
+  COLA[t].push(fila);
+  clearTimeout(NUBE.tRemoto);
+  NUBE.tRemoto = setTimeout(aplicarRemotos, 400);    // agrupa los avisos que llegan juntos
+}
+function aplicarRemotos() {
+  const r = COLA.registros.splice(0), a = COLA.archivos.splice(0), c = COLA.config.splice(0);
+  if (!r.length && !a.length && !c.length) return;
+  let cambio = false;
+  r.forEach((f) => { if (mezclarRegistro(f)) cambio = true; });
+  a.forEach((f) => { if (mezclarArchivo(f)) cambio = true; });
+  c.forEach((f) => { if (mezclarConfig(f)) cambio = true; });
+  if (r.length) { if (reconciliar()) cambio = true; }
+  if (cambio) { reindexar(); guardar(); programarRender(); }
+}
+let tRender = null;
+function programarRender() { clearTimeout(tRender); tRender = setTimeout(() => { if ($('modal').classList.contains('oculto')) render(); else renderNube(); }, 250); }
+function mezclarRegistro(f) {
+  const i = DB.registros.findIndex((x) => x.uid === f.uid);
+  const loc = i >= 0 ? DB.registros[i] : null;
+  if (loc && loc._p) return false;                  // hay un cambio local sin subir: gana el local
+  if (f.borrado) { if (loc) { DB.registros.splice(i, 1); return true; } return false; }
+  const r = deFila(f, loc);
+  r._s = 1;
+  if (loc) DB.registros[i] = r; else DB.registros.push(r);
+  return true;
+}
+function mezclarArchivo(f) {
+  const i = DB.archivos.findIndex((x) => x.uid === f.uid);
+  if (f.borrado) { if (i >= 0) { DB.archivos.splice(i, 1); return true; } return false; }
+  if (i >= 0) return false;
+  const { borrado, actualizado, actualizado_por, ...a } = f;
+  DB.archivos.push(a); return true;
+}
+function mezclarConfig(f) {
+  if (DB.cfgP) return false;
+  if (f.clave === 'ajustes' && f.valor) { DB.ajustes = { ...AJUSTES_DEF, ...f.valor }; return true; }
+  if (f.clave === 'novedades' && f.valor) { DB.novedades = String(f.valor.texto || ''); return true; }
+  return false;
+}
+/**
+ * Si dos equipos importaron el mismo informe al mismo tiempo (o sin internet), el paciente
+ * puede quedar dos veces. Esto lo resuelve igual en todos los equipos:
+ *  - Mismo ID → queda el de uid menor.
+ *  - Sin ID y misma clave → se cuenta lo que trajo el equipo que más registros aportó;
+ *    si ya existe la versión con ID, la sin ID sobra.
+ */
+function reconciliar() {
+  const borrar = new Set();
+  const porId = new Map(), porClave = new Map();
+  DB.registros.forEach((r) => {
+    if (r.demo) return;
+    if (r.id) { if (!porId.has(r.id)) porId.set(r.id, []); porId.get(r.id).push(r); }
+    if (!porClave.has(r.clave)) porClave.set(r.clave, []); porClave.get(r.clave).push(r);
+  });
+  porId.forEach((g) => { if (g.length > 1) g.sort((a, b) => (a.uid < b.uid ? -1 : 1)).slice(1).forEach((x) => borrar.add(x.uid)); });
+  porClave.forEach((g) => {
+    if (g.length < 2) return;
+    const conId = new Set(g.filter((r) => r.id && !borrar.has(r.uid)).map((r) => r.id)).size;
+    const sinId = g.filter((r) => !r.id);
+    if (!sinId.length) return;
+    const porDisp = new Map();
+    sinId.forEach((r) => { const d = r.disp || ''; if (!porDisp.has(d)) porDisp.set(d, []); porDisp.get(d).push(r); });
+    if (porDisp.size < 2 && !conId) return;           // un solo equipo: lo decidió su propia importación
+    let mejor = null;
+    porDisp.forEach((arr) => { arr.sort((a, b) => (a.uid < b.uid ? -1 : 1)); if (!mejor || arr.length > mejor.length || (arr.length === mejor.length && arr[0].uid < mejor[0].uid)) mejor = arr; });
+    const quedan = new Set(mejor.slice(0, Math.max(0, mejor.length - conId)).map((r) => r.uid));
+    sinId.forEach((r) => { if (!quedan.has(r.uid)) borrar.add(r.uid); });
+  });
+  if (!borrar.size) return false;
+  DB.registros = DB.registros.filter((r) => !borrar.has(r.uid));
+  if (esAdmin()) { DB.borrados = (DB.borrados || []).concat([...borrar]); nubeProgramar(); }   // los demás sólo lo ocultan
+  return true;
+}
+async function nubeBajar() {
+  if (!NUBE.cli || !NUBE.ses || NUBE.bajando) return;
+  NUBE.bajando = true;
+  try {
+    const desde = DB.ultimoPull ? new Date(new Date(DB.ultimoPull).getTime() - 2 * 60000).toISOString() : '1970-01-01T00:00:00Z';
+    let max = DB.ultimoPull || null;
+    for (const t of ['registros', 'archivos', 'config']) {
+      for (let i = 0; ; i += 1000) {
+        const { data, error } = await NUBE.cli.from(t).select('*').gt('actualizado', desde).order('actualizado', { ascending: true }).range(i, i + 999);
+        if (error) throw error;
+        (data || []).forEach((f) => { COLA[t].push(f); if (!max || f.actualizado > max) max = f.actualizado; });
+        if (!data || data.length < 1000) break;
+      }
+    }
+    DB.ultimoPull = max;
+    aplicarRemotos();
+    NUBE.ultimaSync = Date.now();
+    NUBE.estado = NUBE.canal ? 'vivo' : 'conectando'; NUBE.error = '';
+    renderNube();
+  } catch (e) { nubeFallo(e); } finally { NUBE.bajando = false; }
+}
+function nubeProgramar() { clearTimeout(NUBE.tSubir); NUBE.tSubir = setTimeout(nubeSubir, 600); }
+async function nubeSubir() {
+  if (!NUBE.cli || !NUBE.ses || NUBE.subiendo) { renderNube(); return; }
+  NUBE.subiendo = true; renderNube();
+  try {
+    const adm = esAdmin();
+    if (!adm) { DB.borrados = []; DB.cfgP = false; DB.vaciarPend = false; }
+    if (DB.vaciarPend) await nubeVaciar();
+    // Registros nuevos o corregidos (los usuarios de carga sólo suben registros nuevos)
+    const pend = DB.registros.filter((r) => r._p && !r.demo && (adm || !r._s));
+    const opc = adm ? { onConflict: 'uid' } : { onConflict: 'uid', ignoreDuplicates: true };
+    for (let i = 0; i < pend.length; i += 500) {
+      const lote = pend.slice(i, i + 500), marcas = lote.map((r) => r._p);
+      const { error } = await NUBE.cli.from('registros').upsert(lote.map(aFila), opc);
+      if (error) throw error;
+      lote.forEach((r, k) => { r._s = 1; if (r._p === marcas[k]) delete r._p; });
+    }
+    // Borrados
+    const bor = (DB.borrados || []).slice();
+    for (let i = 0; i < bor.length; i += 500) {
+      const lote = bor.slice(i, i + 500);
+      const { error } = await NUBE.cli.from('registros').upsert(lote.map((u) => ({ uid: u, borrado: true })), { onConflict: 'uid' });
+      if (error) throw error;
+      DB.borrados = DB.borrados.filter((u) => !lote.includes(u));
+    }
+    // Historial de importaciones
+    const arch = DB.archivos.filter((a) => a._p);
+    if (arch.length) {
+      const { error } = await NUBE.cli.from('archivos').upsert(arch.map(aFilaArchivo), opc);
+      if (error) throw error;
+      arch.forEach((a) => delete a._p);
+    }
+    // Umbrales y novedades
+    if (DB.cfgP) {
+      const { error } = await NUBE.cli.from('config').upsert([{ clave: 'ajustes', valor: DB.ajustes }, { clave: 'novedades', valor: { texto: DB.novedades || '' } }], { onConflict: 'clave' });
+      if (error) throw error;
+      DB.cfgP = false;
+    }
+    NUBE.ultimaSync = Date.now();
+    NUBE.estado = NUBE.canal ? 'vivo' : 'conectando'; NUBE.error = '';
+    if (pend.length || bor.length || arch.length) guardar();
+  } catch (e) { nubeFallo(e); } finally { NUBE.subiendo = false; renderNube(); }
+}
+async function nubeVaciar() {
+  for (const t of ['registros', 'archivos']) {
+    const { error } = await NUBE.cli.from(t).update({ borrado: true }).eq('borrado', false);
+    if (error) throw error;
+  }
+  DB.vaciarPend = false; guardar();
+}
+function textoNube() {
+  const n = pendientes();
+  if (NUBE.estado === 'sinlib') return { c: 'var(--sd)', t: 'Nube no disponible' };
+  if (!NUBE.ses) return { c: 'var(--sd)', t: 'Conectar a la nube' };
+  if (NUBE.subiendo) return { c: 'var(--ambar)', t: 'Subiendo ' + n + '…' };
+  if (NUBE.estado === 'offline') return { c: 'var(--ambar)', t: 'Sin internet' + (n ? ' · ' + n + ' por subir' : '') };
+  if (NUBE.estado === 'error') return { c: 'var(--rojo)', t: 'Error de nube' + (n ? ' · ' + n + ' por subir' : '') };
+  if (NUBE.estado === 'vivo') return { c: n ? 'var(--ambar)' : 'var(--verde)', t: n ? 'En vivo · ' + n + ' por subir' : 'En vivo' };
+  return { c: 'var(--ambar)', t: 'Conectando…' + (n ? ' · ' + n + ' por subir' : '') };
+}
+function renderNube() {
+  const b = $('btnNube'); if (!b) return;
+  const x = textoNube();
+  b.innerHTML = '<span class="punto" style="background:' + x.c + '"></span>☁ ' + esc(x.t) + (NUBE.ses && NUBE.rol ? ' · ' + esc(ROLES[NUBE.rol] || NUBE.rol) : '');
+  b.title = NUBE.error ? 'Último error: ' + NUBE.error : 'Sincronización con otros dispositivos';
+}
+function verNube() {
+  if (NUBE.estado === 'sinlib') {
+    abrirModal('<h3>Nube no disponible</h3><p>No cargó la librería de Supabase (¿sin internet?) o falta la configuración en <b>CONFIG_NUBE</b>. La app sigue funcionando con los datos de este equipo.</p><div class="modal-pie"><button class="btn btn-r" type="button" data-cerrar="1">Cerrar</button></div>');
+    return;
+  }
+  if (!NUBE.ses) {
+    abrirModal('<h3>Conectar a la nube</h3><p class="ref" style="margin-top:0">Con la sesión iniciada, lo que se importe en cualquier equipo se ve en vivo en todos. El usuario lo crea el responsable en Supabase.</p>' +
+      '<form class="form" id="fLogin"><label>Email<input class="campo" name="email" type="email" autocomplete="username" required></label><label>Contraseña<input class="campo" name="clave" type="password" autocomplete="current-password" required></label></form>' +
+      '<p class="err" id="loginErr"></p><div class="modal-pie"><button class="btn" type="button" data-cerrar="1">Cancelar</button><button class="btn btn-r" type="button" id="btnLogin">Ingresar</button></div>');
+    const ir = async () => {
+      const fd = new FormData($('fLogin'));
+      $('btnLogin').disabled = true; $('loginErr').textContent = '';
+      try {
+        const { error } = await NUBE.cli.auth.signInWithPassword({ email: String(fd.get('email') || '').trim(), password: String(fd.get('clave') || '') });
+        if (error) throw error;
+        cerrarModal(); toast('Sesión iniciada. Sincronizando…');
+      } catch (e) {
+        const m = String(e.message || e);
+        $('loginErr').textContent = /invalid login/i.test(m) ? 'Email o contraseña incorrectos.' : /api key/i.test(m) ? 'La clave de Supabase no es válida: revisá CONFIG_NUBE.' : /fetch|network/i.test(m) ? 'Sin conexión con Supabase. Revisá internet.' : 'No se pudo ingresar: ' + m;
+        $('btnLogin').disabled = false;
+      }
+    };
+    $('btnLogin').onclick = ir;
+    $('fLogin').addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); ir(); } });
+    return;
+  }
+  const x = textoNube();
+  abrirModal('<h3>☁ Nube</h3><div class="det-kpi">' + tile('Estado', x.t, '') + tile('Por subir', pendientes(), 'cambios de este equipo') + tile('Última sincronización', NUBE.ultimaSync ? fmtH(new Date(NUBE.ultimaSync)) : '-', NUBE.ultimaSync ? hace(NUBE.ultimaSync, Date.now()) : '') + '</div>' +
+    '<p>Sesión: <b>' + esc(NUBE.ses.user.email || '') + '</b> · permiso: <b>' + esc(ROLES[NUBE.rol] || 'cargando…') + '</b></p>' +
+    '<p class="ref">Observaciones: ' + (CONFIG_NUBE.subirObservaciones ? 'se suben a la nube.' : '<b>no se suben</b>; quedan sólo en el equipo donde se importó el archivo.') + ' Los datos de demo nunca se suben.</p>' +
+    (NUBE.error ? '<p class="err">Último error: ' + esc(NUBE.error) + '</p>' : '') +
+    '<div class="modal-pie"><button class="btn" type="button" id="btnSalirNube">Cerrar sesión</button><button class="btn" type="button" id="btnSyncYa">Sincronizar ahora</button><button class="btn btn-r" type="button" data-cerrar="1">Cerrar</button></div>');
+  $('btnSyncYa').onclick = async () => { cerrarModal(); await nubeBajar(); await nubeSubir(); toast('Sincronizado.'); };
+  $('btnSalirNube').onclick = () => confirmar('¿Cerrar la sesión en este equipo? Los datos quedan guardados acá; lo que esté "por subir" se sube cuando vuelvas a ingresar.', 'Cerrar sesión', async () => { await NUBE.cli.auth.signOut(); nubeDesconectar(); renderNube(); toast('Sesión cerrada.'); });
 }
 
 /* =========================================================================
@@ -2068,6 +2375,85 @@ function tvSalir() {
    EVENTOS
    ========================================================================= */
 function aplicarTema(t) { document.documentElement.dataset.theme = t; pref.set('tema', t); document.querySelector('meta[name=theme-color]').content = t === 'light' ? '#FFFFFF' : '#0A0A0C'; }
+/* ---------- Permisos por usuario (los hace cumplir Supabase; acá sólo se adapta la pantalla) ---------- */
+const ROLES = { admin: 'Administrador', carga: 'Carga', lectura: 'Sólo lectura', ninguno: 'Sin permisos' };
+function esAdmin() { return !NUBE.ses || NUBE.rol === 'admin'; }
+/** Sin sesión, el equipo trabaja local y puede todo (menos administrar usuarios). Con sesión manda el rol. */
+function puede(acc) {
+  if (!NUBE.ses) return acc !== 'usuarios' && acc !== 'historial';
+  if (NUBE.rol === 'admin') return true;
+  if (acc === 'importar') return NUBE.rol === 'carga';
+  return false;
+}
+function avisoPermiso() {
+  toast(!NUBE.rol ? 'Cargando permisos, probá en unos segundos.' : NUBE.rol === 'carga' ? 'Tu usuario es de carga: sólo el administrador puede corregir o borrar datos.' : 'Tu usuario (' + (ROLES[NUBE.rol] || NUBE.rol) + ') no puede hacer esto.', 6000);
+}
+async function nubeRol() {
+  try {
+    const { data, error } = await NUBE.cli.rpc('etac_rol');
+    if (error) throw error;
+    NUBE.rol = data || 'ninguno';
+  } catch (e) {
+    // Si todavía no se corrió etac_permisos.sql, la función no existe y todos tienen acceso completo
+    NUBE.rol = /etac_rol|PGRST202|not find the function|does not exist/i.test(String((e && (e.message || e.code)) || e)) ? 'admin' : 'carga';
+    console.warn('Rol:', e);
+  }
+  if (NUBE.rol !== 'admin') {          // descarta cambios locales que este usuario no puede subir
+    let hubo = false;
+    DB.registros.forEach((r) => { if (r._p && r._s) { delete r._p; hubo = true; } });
+    if (hubo) DB.ultimoPull = null;    // vuelve a bajar la versión buena de la nube
+    DB.borrados = []; DB.cfgP = false; DB.vaciarPend = false;
+    guardar();
+  }
+  render();
+}
+function aplicarPermisosUI() {
+  const vis = (acc, ok) => document.querySelectorAll('[data-acc="' + acc + '"]').forEach((el) => el.classList.toggle('oculto', !ok));
+  vis('umbrales', puede('umbrales')); vis('vaciar', puede('vaciar')); vis('usuarios', puede('usuarios')); vis('historial', puede('historial'));
+  vis('restaurar', puede('importar'));
+  const dz = $('drop'); if (dz) dz.classList.toggle('oculto', !!NUBE.ses && !puede('importar'));
+}
+async function verUsuarios() {
+  if (!puede('usuarios')) { avisoPermiso(); return; }
+  const { data, error } = await NUBE.cli.from('perfiles').select('*').order('email', { ascending: true });
+  if (error) { toast('No se pudo leer la lista de usuarios: ' + error.message, 7000); return; }
+  const yo = NUBE.ses.user.id;
+  abrirModal('<h3>👥 Usuarios y permisos</h3><p class="ref" style="margin-top:0">Los usuarios se crean en Supabase (Authentication → Users → Add user) y entran como <b>Carga</b>. Acá cambiás el permiso; rige desde su próxima acción.</p>' +
+    '<div class="tabla-wrap" style="max-height:55vh"><table class="t"><tr><th>Usuario</th><th>Permiso</th></tr>' +
+    (data || []).map((u) => '<tr><td>' + esc(u.email || u.user_id) + (u.user_id === yo ? ' <span class="ref">(vos)</span>' : '') + '</td><td>' +
+      (u.user_id === yo ? '<b>' + esc(ROLES[u.rol] || u.rol) + '</b>' : '<select class="campo" data-rolde="' + esc(u.user_id) + '">' + ['carga', 'admin', 'lectura'].map((r) => '<option value="' + r + '"' + (u.rol === r ? ' selected' : '') + '>' + ROLES[r] + '</option>').join('') + '</select>') + '</td></tr>').join('') +
+    '</table></div><p class="ref"><b>Carga</b>: importa y mira. <b>Administrador</b>: además corrige, borra, cambia umbrales y permisos. <b>Sólo lectura</b>: sólo mira (TV, jefes).</p>' +
+    '<div class="modal-pie"><button class="btn btn-r" type="button" data-cerrar="1">Cerrar</button></div>');
+  $('modalC').querySelectorAll('[data-rolde]').forEach((sel) => sel.addEventListener('change', async () => {
+    const { error: e2 } = await NUBE.cli.from('perfiles').update({ rol: sel.value }).eq('user_id', sel.dataset.rolde);
+    toast(e2 ? 'No se pudo cambiar: ' + e2.message : 'Permiso actualizado: ' + ROLES[sel.value] + '.');
+  }));
+}
+const CAMPOS_HIST = { fecha: 'Fecha', hora: 'Hora', efectivo: 'Efectivo', base: 'Base', guardia: 'Guardia', cuadrante: 'Cuadrante', sexo: 'Sexo', edad: 'Edad', traslado: 'Traslado', destino: 'Destino', obs: 'Obs.', borrado: 'Borrado', revisar: 'A revisar' };
+async function verHistorialCambios() {
+  if (!puede('historial')) { avisoPermiso(); return; }
+  const { data, error } = await NUBE.cli.from('historial').select('*').eq('tabla', 'registros').order('n', { ascending: false }).range(0, 199);
+  if (error) { toast('No se pudo leer el historial: ' + error.message, 7000); return; }
+  const filas = (data || []).map((h) => {
+    const a = h.antes || {}, d = h.despues || {};
+    const cambios = Object.keys(CAMPOS_HIST).filter((k) => JSON.stringify(a[k]) !== JSON.stringify(d[k]));
+    if (!cambios.length) return '';
+    const txt = cambios.map((k) => k === 'borrado' ? (d.borrado ? '<b class="err">BORRADO</b>' : '<b class="ok">RESTAURADO</b>') : esc(CAMPOS_HIST[k]) + ': ' + esc(k === 'revisar' ? (a[k] || []).length + '→' + (d[k] || []).length : (a[k] ?? '') + ' → ' + (d[k] ?? ''))).join('<br>');
+    return '<tr><td>' + esc(fmtCorta(Date.parse(h.cuando))) + '</td><td>' + esc(h.email || '') + '</td><td>' + esc((a.fecha || '') + ' ' + (a.hora || '') + ' · ' + (a.cuadrante || '') + ' · ' + (a.efectivo || '')) + '</td><td>' + txt + '</td><td><button class="btn btn-sm" type="button" data-volver="' + h.n + '">Volver a como estaba</button></td></tr>';
+  }).join('');
+  abrirModal('<h3>🕘 Historial de cambios</h3><p class="ref" style="margin-top:0">Cada corrección o borrado guarda cómo estaba el registro antes. Podés volverlo atrás.</p>' +
+    (filas ? '<div class="tabla-wrap" style="max-height:60vh"><table class="t"><tr><th>Cuándo</th><th>Quién</th><th>Registro</th><th>Cambio</th><th></th></tr>' + filas + '</table></div>' : '<p class="ref">Todavía no hay correcciones ni borrados.</p>') +
+    '<div class="modal-pie"><button class="btn btn-r" type="button" data-cerrar="1">Cerrar</button></div>');
+  $('modalC').querySelectorAll('[data-volver]').forEach((b) => b.addEventListener('click', async () => {
+    const h = (data || []).find((x) => String(x.n) === b.dataset.volver); if (!h) return;
+    const { actualizado, actualizado_por, ...fila } = h.antes;
+    const { error: e2 } = await NUBE.cli.from('registros').upsert([fila], { onConflict: 'uid' });
+    if (e2) { toast('No se pudo volver atrás: ' + e2.message, 7000); return; }
+    const loc = DB.registros.find((r) => r.uid === fila.uid); if (loc) delete loc._p;
+    cerrarModal(); await nubeBajar(); toast('Registro vuelto a su versión anterior.');
+  }));
+}
+
 function accion(acc) {
   $('menuLista').classList.add('oculto');
   if (acc === 'pdf') elegirAlcance('Informe consolidado (PDF)', exportarPDF, true);
@@ -2079,6 +2465,8 @@ function accion(acc) {
   else if (acc === 'borrarDemo') borrarDemo();
   else if (acc === 'ayuda') verAyuda();
   else if (acc === 'vaciar') vaciarDatos();
+  else if (acc === 'usuarios') verUsuarios();
+  else if (acc === 'historial') verHistorialCambios();
 }
 function conectar() {
   $('btnElegir').onclick = () => $('inArchivos').click();
@@ -2099,6 +2487,7 @@ function conectar() {
     TAB.pag = 0; render();
   }); });
   // Botones del encabezado
+  $('btnNube').onclick = verNube;
   $('btnTema').onclick = () => { aplicarTema(document.documentElement.dataset.theme === 'light' ? 'dark' : 'light'); render(); };
   $('btnTv').onclick = () => (TV.on ? tvSalir() : tvEntrar());
   $('btnTvPausa').onclick = () => { TV.pausa = !TV.pausa; $('btnTvPausa').textContent = TV.pausa ? '▶ Seguir' : '⏸ Pausar'; };
@@ -2142,6 +2531,7 @@ function revisarLibrerias() {
   else { try { pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js'; } catch (e) {} }
   if (!window.Chart) falta.push('<b>Chart.js</b> (los gráficos se muestran en versión simple)');
   if (!window.jspdf) falta.push('<b>jsPDF</b> (no se puede exportar el informe PDF)');
+  if (!window.supabase) falta.push('<b>Supabase</b> (no se sincroniza con otros dispositivos; los cambios quedan guardados acá)');
   if (falta.length) {
     $('banLibs').innerHTML = '⚠ <b>Sin conexión o librería bloqueada.</b> No cargó: ' + falta.join(' · ') + '. Lo ya cargado se sigue viendo, y los archivos <b>CSV y TXT</b> se importan igual. Cuando vuelva internet, recargá la página.';
     $('banLibs').classList.remove('oculto');
@@ -2158,11 +2548,14 @@ function revisarLibrerias() {
   conectar();
   const g = await ALM.leer();
   if (g && Array.isArray(g.registros)) {
-    DB = { registros: g.registros, archivos: g.archivos || [], ajustes: { ...AJUSTES_DEF, ...(g.ajustes || {}) }, novedades: g.novedades || '' };
+    DB = { registros: g.registros, archivos: g.archivos || [], ajustes: { ...AJUSTES_DEF, ...(g.ajustes || {}) }, novedades: g.novedades || '',
+      borrados: g.borrados || [], ultimoPull: g.ultimoPull || null, cfgP: !!g.cfgP, vaciarPend: !!g.vaciarPend };
+    DB.archivos.forEach((a) => { if (!a.uid) { a.uid = uid(); a._p = 1; } });
     DB.registros.forEach((r) => { if (!r.uid) r.uid = uid(); if (!Array.isArray(r.revisar)) r.revisar = []; derivar(r); });
   }
   reindexar();
   render();
+  nubeIniciar();
   const reloj = () => { const d = new Date(); $('reloj').textContent = fmtH(d) + ':' + dd(d.getSeconds()); };
   reloj(); setInterval(reloj, 1000);
   setInterval(() => { if ($('modal').classList.contains('oculto')) render(); }, 60000);   // refresca "hace X min", alertas y referencia

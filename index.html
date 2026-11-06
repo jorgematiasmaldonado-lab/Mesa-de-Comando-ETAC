@@ -2088,6 +2088,15 @@ const aFila = (r) => ({
 const aFilaArchivo = (a) => ({ uid: a.uid, nombre: a.nombre, tipo: a.tipo, importado: a.importado, nuevos: a.nuevos || 0, rep: a.rep || 0, unidos: a.unidos || 0, err: a.err || 0, rev: a.rev || 0,
   efectivo: a.efectivo || '', base: a.base || '', emitido: a.emitido || null, periodo: a.periodo || '', mensaje: a.mensaje || '', borrado: false });
 function deFila(f, loc) {
+  // Se valida igual que un archivo importado (cuadrante inexistente, edad fuera de rango…). Sirve para lo que llega de la app de campo.
+  let n = null;
+  try { n = normalizar({ ...f, edad: f.edad == null ? '' : f.edad, revisar: Array.isArray(f.revisar) ? f.revisar : [] }, {}); } catch (e) { console.warn(e); }
+  if (n) {
+    n.uid = f.uid; n.disp = f.disp || ''; n.importado = f.importado || n.importado; n.archivo_origen = f.archivo_origen || '';
+    if (loc && !n.obs && loc.obs) n.obs = loc.obs;
+    if (loc && !n.crudo && loc.crudo) n.crudo = loc.crudo;
+    return n;
+  }
   const r = { uid: f.uid, id: f.id || '', fecha: f.fecha || '', hora: f.hora || '', efectivo: f.efectivo || '', base: f.base || '', guardia: f.guardia || '', cuadrante: f.cuadrante || '',
     sexo: f.sexo || '', edad: f.edad == null ? '' : f.edad, traslado: f.traslado || 'No', destino: f.destino || '', obs: f.obs || '', crudo: f.crudo || '',
     archivo_origen: f.archivo_origen || '', importado: f.importado || Date.now(), revisar: Array.isArray(f.revisar) ? f.revisar : [], disp: f.disp || '' };

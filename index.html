@@ -5,6 +5,10 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="theme-color" content="#0A0A0C">
 <title>Mesa de Comando ETAC</title>
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="icon" href="icon-192.png">
+<link rel="apple-touch-icon" href="icon-192.png">
+<meta name="apple-mobile-web-app-capable" content="yes">
 
 <!-- Librerías por CDN (versiones exactas). Si alguna no carga, la app avisa con un cartel y sigue funcionando con lo que tenga. -->
 <script src="https://cdn.tailwindcss.com/3.4.16"></script>
@@ -498,7 +502,7 @@ const CONFIG_PREDIO = {
     { nombre: 'Sector de Calma', patron: /SECTOR DE CALMA|\bSC\b/ },
     { nombre: 'Punto de extracción', patron: /EXTRACCION/ }
   ],
-  bases: ['Punilla', 'Sierras Chicas', 'Alta Gracia', 'Norte', 'Traslasierras', 'Río de los Sauces', 'Capilla del Monte'],
+  bases: ['Punilla', 'Sierras Chicas', 'Alta Gracia', 'Norte', 'Traslasierras', 'Río de los Sauces', 'Capilla del Monte', 'Yacanto'],
   guardias: ['Guardia A', 'Guardia B', 'Guardia C']
 };
 
@@ -2550,6 +2554,10 @@ function revisarLibrerias() {
 /* =========================================================================
    INICIO
    ========================================================================= */
+/* Funcionamiento sin internet: si la app está publicada (GitHub Pages), se guarda una copia en el equipo. */
+if ('serviceWorker' in navigator && /^https?:$/.test(location.protocol)) {
+  window.addEventListener('load', () => { navigator.serviceWorker.register('./sw.js').catch((e) => console.warn('Sin modo offline:', e)); });
+}
 (async function iniciar() {
   aplicarTema(pref.get('tema', 'dark'));
   $('pie').textContent = AUTORIA;
